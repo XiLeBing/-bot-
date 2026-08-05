@@ -1,1 +1,1 @@
-worker: python test_gemini.py
+worker: python main.py
