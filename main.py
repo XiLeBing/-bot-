@@ -5,6 +5,7 @@ import google.generativeai as genai
 import asyncio
 from collections import defaultdict, deque
 import time
+import datetime # 用於 Timeout 時間計算
 
 # --- 基礎設定 (從 Railway 環境變數讀取) ---
 DISCORD_TOKEN = os.environ.get('DISCORD_TOKEN')
@@ -25,11 +26,15 @@ intents = discord.Intents.default()
 intents.message_content = True # 必須開啟才能讀取訊息內容
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- 資料儲存 (防刷頻) ---
-# 儲存用戶最近發送的訊息內容和時間
-user_message_history = defaultdict(lambda: deque(maxlen=5)) # 儲存最近5條訊息
+# --- 資料儲存 (防刷頻與管理) ---
+# 儲存用戶最近發送的訊息：{user_id: deque([(timestamp, content), ...], maxlen=10)}
+user_message_history = defaultdict(lambda: deque(maxlen=10)) 
 # 儲存用戶被禁言的狀態和時間
 user_mute_history = defaultdict(lambda: {"is_muted": False, "mute_until": 0, "warned_after_mute": False})
+
+# --- 刷頻防護參數 ---
+SPAM_THRESHOLD = 3 # 10 秒內超過 3 次相同內容
+SPAM_INTERVAL = 10 # 檢查的時間範圍（秒）
 
 # --- 八千代人格提示詞 (System Prompt) ---
 YACHIYO_SYSTEM_PROMPT = f"""
@@ -70,18 +75,22 @@ def is_user_muted(user_id):
 
 async def mute_user(message, user, reason, duration_minutes=10):
     """禁言用戶並刪除刷頻訊息"""
-    # 禁言
+    # 禁言狀態 (內部記錄)
     mute_until = time.time() + (duration_minutes * 60)
     user_mute_history[user.id] = {"is_muted": True, "mute_until": mute_until, "warned_after_mute": False}
     
-    # 刪除刷頻訊息 (這裡簡單刪除當前這一條，實際刷頻需要更複雜的邏輯刪除前幾條)
+    # 刪除訊息與執行 Timeout (需機器人有管理權限)
     try:
-        await message.delete()
+        await message.delete() # 刪除當前這條違規訊息
+        # 執行 Discord 官方的 Timeout (禁言)
+        # await user.timeout(discord.utils.utcnow() + datetime.timedelta(minutes=duration_minutes), reason=reason)
     except discord.Forbidden:
-        await log_to_channel(f"⚠️ 嘗試刪除 {user.name} 的訊息失敗，權限不足。")
+        await log_to_channel(f"⚠️ 嘗試管理 {user.name} 失敗，權限不足 (無法刪除訊息或禁言)。")
+    except Exception as e:
+        await log_to_channel(f"❌ 管理 {user.name} 時出錯: {e}")
 
-    # 發送警告
-    warn_msg = f"{user.mention} 不能亂來喔～你剛剛那段有點不太行欸。如有再發送這種訊息，我只能送客了喔～"
+    # 發送警告 (八千代口吻)
+    warn_msg = f"不能亂來喔～嘿嘿～{user.mention}，你剛剛那段有點不太行欸。我先讓你休息 {duration_minutes} 分鐘喔～"
     await message.channel.send(warn_msg)
     
     # 記錄日誌
@@ -112,6 +121,7 @@ async def on_message(message):
 
     user = message.author
     content = message.content.strip()
+    current_time = time.time()
 
     # --- 1. 檢查禁言狀態和進階處置 (送客) ---
     if is_user_muted(user.id):
@@ -129,17 +139,24 @@ async def on_message(message):
                 pass
             return
 
-    # --- 2. 防刷頻機制 (同樣內容 > 3次) ---
-    # 記錄訊息內容
-    user_message_history[user.id].append(content)
+    # --- 2. 防刷頻機制 (修正版：10秒內同樣內容 > 3次) ---
+    # 記錄訊息內容和時間
+    user_message_history[user.id].append((current_time, content))
+    
     # 檢查是否刷頻
-    if len(user_message_history[user.id]) >= 3:
-        recent_msgs = list(user_message_history[user.id])
-        if all(msg == recent_msgs[0] for msg in recent_msgs[-3:]):
-            # 刷頻偵測成功
-            await mute_user(message, user, "刷頻 (同樣內容發送超過 3 次)")
-            user_message_history[user.id].clear() # 清空歷史
-            return
+    recent_messages = user_message_history[user.id]
+    # 篩選出在 SPAM_INTERVAL 內，且內容與當前相同的訊息
+    identical_messages_in_interval = [
+        msg_content for msg_time, msg_content in recent_messages
+        if current_time - msg_time <= SPAM_INTERVAL and msg_content == content
+    ]
+
+    if len(identical_messages_in_interval) >= SPAM_THRESHOLD:
+        # 刷頻偵測成功
+        await mute_user(message, user, f"刷頻 ({SPAM_INTERVAL}秒內同樣內容發送 {len(identical_messages_in_interval)} 次)")
+        user_message_history[user.id].clear() # 清空歷史，避免重複觸發
+        return
+
 
     # --- 3. AI 管理與回覆邏輯 ---
 
