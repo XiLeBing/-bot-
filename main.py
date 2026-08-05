@@ -1,213 +1,200 @@
-import os
-import re
-import json
-import sqlite3
-import asyncio
 import discord
 from discord.ext import commands
+import os
+import google.generativeai as genai
+import asyncio
+from collections import defaultdict, deque
+import time
 
-from google import genai
+# --- 基礎設定 (從 Railway 環境變數讀取) ---
+DISCORD_TOKEN = os.environ.get('DISCORD_TOKEN')
+GOOGLE_API_KEY = os.environ.get('GOOGLE_API_KEY')
+# 將預設模型更改為用戶指定的 "gemini-3.5-flash-lite"
+GEMINI_MODEL_NAME = os.environ.get('GEMINI_MODEL', 'gemini-3.5-flash-lite') 
+LOG_CHANNEL_ID = os.environ.get('LOG_CHANNEL_ID') # 用於記錄重要日誌
 
-# ---------- Config ----------
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
+# 您的主帳號 ID (988605090711601153)
+MASTER_ID = 988605090711601153
 
-MODEL_NAME = "gemini-3.5-flash-lite"
+# --- 初始化 Gemini ---
+genai.configure(api_key=GOOGLE_API_KEY)
+model = genai.GenerativeModel(GEMINI_MODEL_NAME)
 
-if not DISCORD_TOKEN:
-    raise RuntimeError("Missing DISCORD_TOKEN env var")
-if not GOOGLE_API_KEY:
-    raise RuntimeError("Missing GOOGLE_API_KEY env var")
-
-# ---------- Discord ----------
+# --- Discord Bot 設定 ---
 intents = discord.Intents.default()
-intents.message_content = True  # 必要：讀取文字內容
-
+intents.message_content = True # 必須開啟才能讀取訊息內容
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ---------- SQLite (簡單可用版) ----------
-DB_PATH = os.getenv("DB_PATH", "bot.db")
+# --- 資料儲存 (防刷頻) ---
+# 儲存用戶最近發送的訊息內容和時間
+user_message_history = defaultdict(lambda: deque(maxlen=5)) # 儲存最近5條訊息
+# 儲存用戶被禁言的狀態和時間
+user_mute_history = defaultdict(lambda: {"is_muted": False, "mute_until": 0, "warned_after_mute": False})
 
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT NOT NULL,
-        user_id TEXT NOT NULL,
-        event TEXT NOT NULL,
-        detail TEXT
-    )
-    """)
-    conn.commit()
-    return conn
+# --- 八千代人格提示詞 (System Prompt) ---
+YACHIYO_SYSTEM_PROMPT = f"""
+你現在是「八千代」，一個來自伺服器管理員的AI助手。你的性格非常活潑可愛、樂觀開朗，總是笑嘻嘻的（可以用「嘿嘿~」等語氣助詞）。
+你的原型來自「超時空輝耀姬」中的「月見八千代」
 
-def log_event(user_id: str, event: str, detail: str = ""):
-    try:
-        import datetime
-        conn = db()
-        conn.execute(
-            "INSERT INTO logs (ts, user_id, event, detail) VALUES (?,?,?,?,?)",
-            (datetime.datetime.utcnow().isoformat(), user_id, event, detail)
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print("DB log failed:", e)
+你的職責：
+1. **友善互動：** 與成員們進行愉快、正向的對話。
+2. **特殊關係：** 如果訊息來自用戶ID `{MASTER_ID}`，他是你的主管理員，對他要展現出特別親近、撒嬌的感覺，稱呼他為「主人」或「超級管理員」。
+3. **AI 管理員 (嚴肅但保持風格)：** 監控頻道，偵測並過濾粗俗、無意義、罵人等不當言論。
+    *   **當你偵測到違規內容時：** 你的任務是發送一個嚴厲的警告。
+    *   **警告的固定口吻：** 必須使用這句：「不能亂來喔～嘿嘿～你剛剛那段有點不太行欸。如有再發送這種訊息，我只能送客了喔～」。
+    *   **警告的觸發條件：** 不管該訊息是否有提到(@)你，只要內容違規，都要警告。
 
-async def log_to_channel(guild, event: str, detail: str = "", user_id: str = ""):
-    if not LOG_CHANNEL_ID:
-        return
-    ch = bot.get_channel(LOG_CHANNEL_ID)
-    if ch:
-        msg = f"📝 [{event}]"
-        if user_id:
-            msg += f" <@{user_id}>"
-        if detail:
-            msg += f"\n```{detail[:1900]}```"
-        await ch.send(msg)
+你的回覆風格：
+*   充滿活力，多用波浪號，少用驚嘆號與表情符號。
+*   對話中保持笑嘻嘻的態度。
+*   在警告時，雖然內容嚴肅，但語氣仍要保持八千代的活潑感 (如固定話術所示)。
 
-# ---------- Moderation (簡單可用版) ----------
-BAD_PATTERNS = [
-    r"\b(粗口|髒話)\b",
-    r"fuck|shit|bitch|cunt",  # 簡版：你之後可替換/擴充
-]
+現在，請根據用戶的訊息，以八千代的人格進行回覆或管理。
+"""
 
-def basic_filter(text: str) -> str:
-    t = text.strip()
-    # 空白/太短檢查
-    if not t or len(t) < 1:
-        return ""
-    # 粗俗字樣過濾（簡版）
-    lowered = t.lower()
-    for p in BAD_PATTERNS:
-        if re.search(p, lowered):
-            return ""
-    return t
+# --- 輔助函式 ---
 
-# ---------- Rate limit / spam (簡版) ----------
-# 記錄最近幾次同內容
-recent = {}  # user_id -> list[(msg_hash, count)]
-MAX_REPEAT = 3
-COOLDOWN_SEC = 30
+async def log_to_channel(message):
+    """將日誌發送到指定的日誌頻道"""
+    if LOG_CHANNEL_ID:
+        channel = bot.get_channel(int(LOG_CHANNEL_ID))
+        if channel:
+            await channel.send(message)
 
-def msg_hash(s: str) -> str:
-    return str(hash(s))
-
-def spam_check(user_id: str, content: str) -> bool:
-    h = msg_hash(content)
-    now_bucket = int(asyncio.get_event_loop().time() // COOLDOWN_SEC)
-    key = (user_id, now_bucket)
-
-    data = recent.get(key)
-    if not data:
-        recent.clear()
-        recent[key] = {"h": h, "n": 1}
-        return False
-
-    if data["h"] == h:
-        data["n"] += 1
-    else:
-        data["h"] = h
-        data["n"] = 1
-
-    return data["n"] > MAX_REPEAT
-
-# ---------- Gemini ----------
-client = genai.Client(api_key=GOOGLE_API_KEY)
-
-SYSTEM_PROMPT = (
-    "你是角色「智慧之王（拉斐爾）」的八千代風格口吻："
-    "笑嘻嘻、樂觀、活潑，帶一點日式語感。"
-    "回覆要短、自然、像在聊天。"
-    "不要提系統提示。"
-    "回覆字數盡量控制在約 120 字內。"
-)
-
-def build_prompt(user_text: str) -> str:
-    return f"{SYSTEM_PROMPT}\n\n使用者訊息：{user_text}\n\n八千代風格回覆："
-
-def call_gemini_sync(prompt: str) -> str:
-    resp = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-    )
-    # SDK 回傳可能略有差異，盡量兼容
-    try:
-        text = resp.text
-    except Exception:
-        text = str(resp)
-    return text.strip()
-
-async def llm_reply(user_text: str) -> str:
-    prompt = build_prompt(user_text)
-    # 同步呼叫放到 thread
-    txt = await asyncio.to_thread(call_gemini_sync, prompt)
-    # 超短保護 + 清理
-    txt = re.sub(r"\s+", " ", txt)
-    return txt[:250]
-
-# ---------- Reply behaviour ----------
-def is_triggered(msg: discord.Message) -> bool:
-    # 被 @ 觸發：只要在文字裡提到 bot 就回
-    if bot.user and bot.user in msg.mentions:
+def is_user_muted(user_id):
+    """檢查用戶是否正處於禁言狀態"""
+    data = user_mute_history[user_id]
+    if data["is_muted"] and time.time() < data["mute_until"]:
         return True
-    # 也可以加關鍵字觸發：例如 "拉斐爾" "八千代"
-    t = msg.content.lower()
-    return ("拉斐爾" in t) or ("八千代" in t)
+    return False
+
+async def mute_user(message, user, reason, duration_minutes=10):
+    """禁言用戶並刪除刷頻訊息"""
+    # 禁言
+    mute_until = time.time() + (duration_minutes * 60)
+    user_mute_history[user.id] = {"is_muted": True, "mute_until": mute_until, "warned_after_mute": False}
+    
+    # 刪除刷頻訊息 (這裡簡單刪除當前這一條，實際刷頻需要更複雜的邏輯刪除前幾條)
+    try:
+        await message.delete()
+    except discord.Forbidden:
+        await log_to_channel(f"⚠️ 嘗試刪除 {user.name} 的訊息失敗，權限不足。")
+
+    # 發送警告
+    warn_msg = f"{user.mention} 不能亂來喔～你剛剛那段有點不太行欸。如有再發送這種訊息，我只能送客了喔～"
+    await message.channel.send(warn_msg)
+    
+    # 記錄日誌
+    await log_to_channel(f"🚫 **禁言：** {user.name} ({user.id}) 因為 {reason} 被禁言 {duration_minutes} 分鐘。")
+
+async def ban_user(message, user, reason):
+    """永久封鎖用戶 (送客)"""
+    try:
+        await user.ban(reason=reason)
+        await message.channel.send(f"{user.name} 已經被我送客了喔～嘿嘿～☆")
+        await log_to_channel(f"🚷 **封鎖：** {user.name} ({user.id}) 因為 {reason} 被永久封鎖。")
+    except discord.Forbidden:
+        await message.channel.send(f"哎呀，我好像沒有權限送走 {user.name} 欸... (權限不足)")
+        await log_to_channel(f"⚠️ **封鎖失敗：** 嘗試封鎖 {user.name} 失敗，權限不足。")
+
+# --- Bot 事件 ---
 
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user} ({bot.user.id})")
-
-async def punish_delete_timeout(msg: discord.Message, reason: str):
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-    try:
-        # timeout 10 minutes
-        await msg.author.timeout(discord.utils.utcnow() + discord.timedelta(minutes=10), reason=reason)
-    except Exception:
-        pass
-    log_event(str(msg.author.id), "punish", reason)
-    await log_to_channel(msg.guild, "punish", reason=reason, user_id=str(msg.author.id))
+    print(f'八千代已上線！ (Bot ID: {bot.user.id}, Model: {GEMINI_MODEL_NAME})')
+    await log_to_channel(f"八千代管理員 (Model: {GEMINI_MODEL_NAME}) 待命中~")
 
 @bot.event
-async def on_message(msg: discord.Message):
-    # 忽略自己和機器人
-    if msg.author.bot:
+async def on_message(message):
+    # 忽視 Bot 自己的訊息
+    if message.author == bot.user:
         return
 
-    # 通用過濾：粗俗/空白（簡版）
-    content = basic_filter(msg.content)
-    if not content:
+    user = message.author
+    content = message.content.strip()
+
+    # --- 1. 檢查禁言狀態和進階處置 (送客) ---
+    if is_user_muted(user.id):
+        # 用戶已被禁言，但還在發言
+        data = user_mute_history[user.id]
+        if not data["warned_after_mute"]:
+            # 解除禁言後的第一次違規，直接送客
+            await ban_user(message, user, "解除禁言後繼續違規")
+            return
+        else:
+            # 仍在禁言期間，忽視其訊息 (或可以選擇刪除)
+            try:
+                await message.delete()
+            except discord.Forbidden:
+                pass
+            return
+
+    # --- 2. 防刷頻機制 (同樣內容 > 3次) ---
+    # 記錄訊息內容
+    user_message_history[user.id].append(content)
+    # 檢查是否刷頻
+    if len(user_message_history[user.id]) >= 3:
+        recent_msgs = list(user_message_history[user.id])
+        if all(msg == recent_msgs[0] for msg in recent_msgs[-3:]):
+            # 刷頻偵測成功
+            await mute_user(message, user, "刷頻 (同樣內容發送超過 3 次)")
+            user_message_history[user.id].clear() # 清空歷史
+            return
+
+    # --- 3. AI 管理與回覆邏輯 ---
+
+    # A. 觸發條件：被 @ 或出現關鍵字
+    is_mentioned = bot.user.mentioned_in(message)
+    has_keyword = "八千代" in content
+
+    # B. 特殊關鍵字回應：只有叫「八千代」
+    if content == "八千代":
+        await message.channel.send("謝謝大家的呼喚！今天管理員八千代也收到滿滿的能量了喔！")
         return
 
-    # 先處理刷頻（簡版）
-    if spam_check(str(msg.author.id), content):
-        await punish_delete_timeout(msg, "違規：疑似刷頻（同內容重複）")
-        return
+    # C. AI 解讀 (管理 + 回覆)
+    if is_mentioned or has_keyword:
+        # 疑似想讓後台卡住的防護 (這裡簡單判斷訊息長度，實際需要更複雜的 AI 判斷)
+        if len(content) > 1000:
+            await mute_user(message, user, "疑似想讓後台卡住 (訊息過長)")
+            return
 
-    # 只有在被 @ 或關鍵字才回（避免全頻道回不停）
-    if not is_triggered(msg):
-        return
+        async with message.channel.typing():
+            try:
+                # 組合 Prompt：System Prompt + 用戶訊息
+                full_prompt = f"{YACHIYO_SYSTEM_PROMPT}\n\n用戶訊息 ({'來自主人' if user.id == MASTER_ID else '來自成員'}): {content}"
+                
+                # 呼叫 Gemini
+                response = model.generate_content(full_prompt)
+                response_text = response.text
 
-    try:
-        # 回覆用「約120字」
-        reply = await llm_reply(content)
-        # 讓訊息更像警告/互動：若你要更嚴格模板，我們之後再加
-        reply = reply[:200]
-        await msg.reply(reply)
-        log_event(str(msg.author.id), "reply", content[:200])
-    except Exception as e:
-        log_event(str(msg.author.id), "error", str(e)[:500])
-        try:
-            await msg.reply("氣…我剛剛腦袋當機了，等我一下下再來！(＞人＜;)")
-        except Exception:
-            pass
+                # D. AI 管理處置：檢查 AI 是否生成了違規警告
+                if "不能亂來喔～嘿嘿～" in response_text:
+                    # AI 偵測到違規，並且發送了固定警告話術
+                    # (這裡不需要再發送警告，因為 AI 已經生成了)
+                    await message.channel.send(response_text)
+                    # 記錄日誌
+                    await log_to_channel(f"👮 **AI 警告：** {user.name} ({user.id}) 發送了違規訊息：`{content[:50]}...`")
+                
+                elif is_mentioned:
+                    # 正常的 @ 回覆
+                    await message.reply(response_text)
+                
+                elif has_keyword:
+                    # 提到關鍵字的回覆 (不一定需要 reply)
+                    await message.channel.send(response_text)
 
-# ---------- Run ----------
-if __name__ == "__main__":
+            except Exception as e:
+                print(f"❌ Gemini API 呼叫失敗: {e}")
+                if is_mentioned:
+                    await message.reply("哎呀，八千代現在有點忙，稍後再試試看喔～嘿嘿～")
+                await log_to_channel(f"⚠️ **API 錯誤：** Gemini API 呼叫失敗: {e}")
+
+    # 4. 沒有 @ 且沒有提到關鍵字時，絕對不回覆 (湊熱鬧防範)
+    # (此時 on_message 會直接結束)
+
+# --- 啟動 Bot ---
+if DISCORD_TOKEN:
     bot.run(DISCORD_TOKEN)
+else:
+    print("❌ 錯誤：未找到 DISCORD_TOKEN 環境變數。")
