@@ -1,1 +1,1 @@
-worker: python bot.py
+worker: python test_gemini.py
